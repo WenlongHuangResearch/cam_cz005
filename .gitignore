@@ -1,0 +1,34 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+.venv/
+venv/
+*.egg-info/
+
+# ===== 程序输出 =====
+out/
+*.csv
+
+# ===== Visual Studio / C++ 构建产物 =====
+x64/
+Debug/
+Release/
+*.obj
+*.ilk
+*.pdb
+*.idb
+*.exe
+*.log
+*.tlog
+*.recipe
+*.lastbuildstate
+
+# ===== Windows / WSL 杂项 =====
+*:Zone.Identifier
+*Zone.Identifier
+.DS_Store
+Thumbs.db
+
+# ===== 厂商保密资料 (公开仓库默认排除; 如已获授权可手动移除下面几行) =====
+*.pdf
+TimeStamp_Data_Decode_DemoCode_V010002/
