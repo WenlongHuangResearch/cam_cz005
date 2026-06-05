@@ -30,5 +30,4 @@ Release/
 Thumbs.db
 
 # ===== 厂商保密资料 (公开仓库默认排除; 如已获授权可手动移除下面几行) =====
-*.pdf
-TimeStamp_Data_Decode_DemoCode_V010002/
+
