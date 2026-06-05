@@ -55,7 +55,9 @@ def resolve_backend(name: str) -> int:
     if sys.platform.startswith("linux"):
         return cv2.CAP_V4L2
     if sys.platform.startswith("win"):
-        return cv2.CAP_MSMF      # Windows UVC + 高分辨率 MJPG 用 MSMF 较稳
+        # 实测: MSMF 按索引取流不稳(fourcc 设不动、~13fps); DShow 能真正切到
+        # MJPG 并跑满高帧率, 故 Windows 默认用 DShow。
+        return cv2.CAP_DSHOW
     if sys.platform == "darwin":
         return _BACKENDS["avfoundation"]
     return cv2.CAP_ANY
@@ -106,11 +108,16 @@ def open_camera(device, width, height, fps, fourcc,
     if not cap.isOpened():
         raise RuntimeError(f"无法打开相机 {device}")
 
-    # 顺序很重要: 先 FOURCC, 再分辨率, 最后帧率
-    cap.set(cv2.CAP_PROP_FOURCC, cv2.VideoWriter_fourcc(*fourcc))
+    # 顺序很重要: 先 FOURCC, 再分辨率, 最后帧率。
+    # Windows(DShow) 有个坑: 只设一次 FOURCC 常被忽略, 退回 YUY2 ->
+    # 4000x1200 被 USB3 带宽限制只剩 ~15fps。所以分辨率设完后再设一次 FOURCC,
+    # 强制切到 MJPG (实测这样 dshow 才会真正生效)。
+    fcc = cv2.VideoWriter_fourcc(*fourcc)
+    cap.set(cv2.CAP_PROP_FOURCC, fcc)
     cap.set(cv2.CAP_PROP_FRAME_WIDTH, width)
     cap.set(cv2.CAP_PROP_FRAME_HEIGHT, height)
     cap.set(cv2.CAP_PROP_FPS, fps)
+    cap.set(cv2.CAP_PROP_FOURCC, fcc)
     # 尽量减小内部缓冲, 让 FPS 反映真实到达率
     try:
         cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)

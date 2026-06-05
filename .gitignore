@@ -9,6 +9,14 @@ venv/
 out/
 *.csv
 
+# ===== 录制 / 媒体产物 (体积大, 不入库) =====
+recordings/
+*.mp4
+*.hevc
+*.h265
+*.bmp
+*.png
+
 # ===== Visual Studio / C++ 构建产物 =====
 x64/
 Debug/
