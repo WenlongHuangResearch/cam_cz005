@@ -14,6 +14,7 @@ struct RingBuffer {
     rb_free_fn free_fn;
     pthread_mutex_t mtx;
     pthread_cond_t not_empty;
+    pthread_cond_t not_full;   /* 供阻塞式 push 等待 */
 };
 
 RingBuffer *rb_create(size_t capacity, rb_free_fn free_fn)
@@ -32,6 +33,7 @@ RingBuffer *rb_create(size_t capacity, rb_free_fn free_fn)
     rb->free_fn = free_fn;
     pthread_mutex_init(&rb->mtx, NULL);
     pthread_cond_init(&rb->not_empty, NULL);
+    pthread_cond_init(&rb->not_full, NULL);
     return rb;
 }
 
@@ -48,6 +50,7 @@ void rb_destroy(RingBuffer *rb)
     }
     pthread_mutex_destroy(&rb->mtx);
     pthread_cond_destroy(&rb->not_empty);
+    pthread_cond_destroy(&rb->not_full);
     free(rb->buf);
     free(rb);
 }
@@ -76,6 +79,23 @@ int rb_push(RingBuffer *rb, void *item)
     return 0;
 }
 
+int rb_push_block(RingBuffer *rb, void *item)
+{
+    pthread_mutex_lock(&rb->mtx);
+    while (rb->count == rb->cap && !rb->closed)
+        pthread_cond_wait(&rb->not_full, &rb->mtx);
+    if (rb->closed) {
+        pthread_mutex_unlock(&rb->mtx);
+        return -1;
+    }
+    rb->buf[rb->tail] = item;
+    rb->tail = (rb->tail + 1) % rb->cap;
+    rb->count++;
+    pthread_cond_signal(&rb->not_empty);
+    pthread_mutex_unlock(&rb->mtx);
+    return 0;
+}
+
 int rb_pop(RingBuffer *rb, void **out)
 {
     pthread_mutex_lock(&rb->mtx);
@@ -88,6 +108,7 @@ int rb_pop(RingBuffer *rb, void **out)
     *out = rb->buf[rb->head];
     rb->head = (rb->head + 1) % rb->cap;
     rb->count--;
+    pthread_cond_signal(&rb->not_full);
     pthread_mutex_unlock(&rb->mtx);
     return 0;
 }
@@ -97,6 +118,7 @@ void rb_close(RingBuffer *rb)
     pthread_mutex_lock(&rb->mtx);
     rb->closed = 1;
     pthread_cond_broadcast(&rb->not_empty);
+    pthread_cond_broadcast(&rb->not_full);
     pthread_mutex_unlock(&rb->mtx);
 }
 

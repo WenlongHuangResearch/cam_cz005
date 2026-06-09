@@ -29,6 +29,10 @@ void rb_destroy(RingBuffer *rb);
  * 返回 0 成功; -1 表示队列已关闭 (此时 item 不入队, 调用方应自行释放)。 */
 int rb_push(RingBuffer *rb, void *item);
 
+/* 入队 (阻塞)。队列满时阻塞等待消费者取走, 不丢弃元素 (保证序号无空洞)。
+ * 返回 0 成功; -1 表示队列已关闭 (此时 item 不入队, 调用方应自行释放)。 */
+int rb_push_block(RingBuffer *rb, void *item);
+
 /* 出队 (阻塞)。返回 0 并把元素写入 *out; 当队列已关闭且为空时返回 -1。 */
 int rb_pop(RingBuffer *rb, void **out);
 

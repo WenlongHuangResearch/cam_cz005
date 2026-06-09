@@ -56,39 +56,122 @@ static void frame_item_free(void *p)
     free(it);
 }
 
-/* ---------------- 编码线程参数 ---------------- */
+/* ---------------- 队列元素: 一个待解码的 MJPEG 包 (带采集序号) ---------------- */
 typedef struct {
-    RingBuffer *rb;
+    AVPacket *pkt;
+    int64_t seq;          /* 采集顺序号, 用于解码后重排 */
+} PktItem;
+
+static void packet_item_free(void *p)
+{
+    PktItem *it = (PktItem *)p;
+    if (!it)
+        return;
+    av_packet_free(&it->pkt);
+    free(it);
+}
+
+/* 把整帧某半幅 (yuv420p) 转成 NV12 半幅帧 (定义在下方) */
+static AVFrame *make_half_nv12(struct SwsContext *sws, const AVFrame *src,
+                               int x_off, int half_w, int height);
+
+/* ============================================================================
+ *  每一路 (左/右) 拆成两级流水线: [转换线程 sws] -> [nv12队列] -> [编码线程 amf]
+ *  sws(~12ms) 与 amf编码(~8ms) 串在一条线程里会超 60fps 预算(16.67ms)、长录丢帧;
+ *  拆成两级后各级单独都在预算内, 可持续 60fps。
+ * ========================================================================== */
+
+/* ---------------- 转换线程: 整幅引用 -> 切本路半幅 -> NV12 -> 推 nv12 队列 ---- */
+typedef struct {
+    RingBuffer *in;       /* 上游: 整幅解码帧引用 (FrameItem) */
+    RingBuffer *out;      /* 下游: 本路 NV12 半幅帧 (FrameItem) */
+    int width, height, x_off;
+    const char *tag;
+    int64_t prof_sws, prof_n;
+} ConvertArg;
+
+/* MJPEG 解出的是 yuvj420p (JPEG 全范围), 直接喂 sws 会走"范围转换"慢路径。
+ * 我们只想原样打包成 NV12, 故把 yuvj420p 视作 yuv420p, 命中 sws 无缩放快速拷贝。 */
+static enum AVPixelFormat dejpeg_fmt(int fmt)
+{
+    switch (fmt) {
+        case AV_PIX_FMT_YUVJ420P: return AV_PIX_FMT_YUV420P;
+        case AV_PIX_FMT_YUVJ422P: return AV_PIX_FMT_YUV422P;
+        case AV_PIX_FMT_YUVJ444P: return AV_PIX_FMT_YUV444P;
+        default: return (enum AVPixelFormat)fmt;
+    }
+}
+
+static void *convert_thread(void *varg)
+{
+    ConvertArg *a = (ConvertArg *)varg;
+    struct SwsContext *sws = NULL;
+    void *item;
+    while (rb_pop(a->in, &item) == 0) {
+        FrameItem *it = (FrameItem *)item;
+        if (!sws) {
+            sws = sws_getContext(a->width, a->height, dejpeg_fmt(it->frame->format),
+                                 a->width, a->height, AV_PIX_FMT_NV12,
+                                 SWS_POINT, NULL, NULL, NULL);
+            if (!sws) {
+                fprintf(stderr, "[%s转换] sws_getContext 失败\n", a->tag);
+                frame_item_free(it);
+                continue;
+            }
+        }
+        int64_t ts0 = av_gettime_relative();
+        AVFrame *nv12 = make_half_nv12(sws, it->frame, a->x_off, a->width, a->height);
+        a->prof_sws += av_gettime_relative() - ts0;
+        a->prof_n++;
+        if (nv12) {
+            nv12->pts = it->frame_idx;
+            FrameItem *oit = malloc(sizeof(*oit));
+            oit->frame = nv12; oit->frame_idx = it->frame_idx;
+            if (rb_push(a->out, oit) < 0) frame_item_free(oit);
+        }
+        frame_item_free(it);
+    }
+    if (sws) sws_freeContext(sws);
+    rb_close(a->out);     /* 让下游编码线程收尾 */
+    return NULL;
+}
+
+/* ---------------- 编码线程: 取 NV12 -> hevc_amf 编码 -> 写裸流 ---- */
+typedef struct {
+    RingBuffer *in;       /* 上游: NV12 半幅帧 (FrameItem) */
     char enc_name[64];
     char out_path[512];
     int width, height, fps, bitrate_kbps;
-    const char *tag;      /* "左"/"右", 仅日志 */
-    int ok;               /* 线程是否正常完成 */
+    const char *tag;
+    int ok;
     long frames;
-} EncoderThreadArg;
+    int64_t prof_enc, prof_n;
+} EncodeArg;
 
-static void *encoder_thread(void *varg)
+static void *encode_thread(void *varg)
 {
-    EncoderThreadArg *a = (EncoderThreadArg *)varg;
+    EncodeArg *a = (EncodeArg *)varg;
     char err[256] = {0};
     Encoder *enc = encoder_create(a->enc_name, a->width, a->height, a->fps,
                                   a->bitrate_kbps, a->out_path, err, sizeof(err));
     if (!enc) {
         fprintf(stderr, "[%s编码] 创建编码器失败: %s\n", a->tag, err);
-        /* 把队列抽干, 避免采集线程因满队列无谓丢帧后仍卡住 (其实不会卡) */
         void *item;
-        while (rb_pop(a->rb, &item) == 0)
+        while (rb_pop(a->in, &item) == 0)
             frame_item_free(item);
         a->ok = 0;
         return NULL;
     }
 
     void *item;
-    while (rb_pop(a->rb, &item) == 0) {
+    while (rb_pop(a->in, &item) == 0) {
         FrameItem *it = (FrameItem *)item;
+        int64_t ts0 = av_gettime_relative();
         if (encoder_send(enc, it->frame) < 0)
             fprintf(stderr, "[%s编码] 帧 %lld 编码出错\n", a->tag,
                     (long long)it->frame_idx);
+        a->prof_enc += av_gettime_relative() - ts0;
+        a->prof_n++;
         frame_item_free(it);
     }
     a->frames = encoder_finish(enc);
@@ -143,6 +226,248 @@ static AVFrame *make_half_nv12(struct SwsContext *sws, const AVFrame *src,
     return dst;
 }
 
+/* ============================================================================
+ *  并行解码: 单线程 MJPEG 解码 ~32ms/帧 (4000x1200), 远超 60fps 预算, 且该
+ *  解码器不支持 slice 多线程。MJPEG 是帧内编码、各帧独立, 故用「多个独立解码器
+ *  实例」并行解码不同帧, 再按采集序号重排, 恢复顺序后交给后续 IMU/编码。
+ *
+ *  采集(主) -> [pkt_q] -> N×解码worker -> [Reorder 重排] -> 收集线程 -> rb_l/rb_r
+ * ========================================================================== */
+
+/* ---------------- 重排缓冲: 多生产者(解码worker)插入, 单消费者(收集线程)按序取 ---- */
+typedef struct {
+    pthread_mutex_t mu;
+    pthread_cond_t  can_insert;   /* 有空位 */
+    pthread_cond_t  can_emit;     /* 有新帧 / 生产者退出 */
+    int      cap;
+    int64_t *seq;                 /* 各槽位的采集序号 */
+    AVFrame **frm;                /* 各槽位的解码帧 */
+    int      count;
+    int64_t  next_emit;           /* 下一个要输出的序号 */
+    int      producers;           /* 仍在工作的解码worker数 */
+} Reorder;
+
+static Reorder *reorder_create(int cap, int producers)
+{
+    Reorder *r = calloc(1, sizeof(*r));
+    r->cap = cap;
+    r->seq = malloc(sizeof(int64_t) * cap);
+    r->frm = calloc(cap, sizeof(AVFrame *));
+    for (int i = 0; i < cap; i++) r->seq[i] = -1;
+    r->next_emit = 0;
+    r->producers = producers;
+    pthread_mutex_init(&r->mu, NULL);
+    pthread_cond_init(&r->can_insert, NULL);
+    pthread_cond_init(&r->can_emit, NULL);
+    return r;
+}
+
+static void reorder_destroy(Reorder *r)
+{
+    if (!r) return;
+    for (int i = 0; i < r->cap; i++)
+        if (r->frm[i]) av_frame_free(&r->frm[i]);
+    pthread_mutex_destroy(&r->mu);
+    pthread_cond_destroy(&r->can_insert);
+    pthread_cond_destroy(&r->can_emit);
+    free(r->seq); free(r->frm); free(r);
+}
+
+/* 解码worker插入一帧 (阻塞直到有空位)。cap 已保证 > 最大乱序跨度, 不会死锁。 */
+static void reorder_insert(Reorder *r, int64_t seq, AVFrame *f)
+{
+    pthread_mutex_lock(&r->mu);
+    while (r->count == r->cap)
+        pthread_cond_wait(&r->can_insert, &r->mu);
+    int i;
+    for (i = 0; i < r->cap; i++)
+        if (r->seq[i] < 0) break;
+    r->seq[i] = seq;
+    r->frm[i] = f;
+    r->count++;
+    pthread_cond_signal(&r->can_emit);
+    pthread_mutex_unlock(&r->mu);
+}
+
+/* 一个解码worker退出: 生产者计数减一, 归零时唤醒收集线程收尾。 */
+static void reorder_producer_done(Reorder *r)
+{
+    pthread_mutex_lock(&r->mu);
+    r->producers--;
+    if (r->producers == 0)
+        pthread_cond_broadcast(&r->can_emit);
+    pthread_mutex_unlock(&r->mu);
+}
+
+/* 收集线程按 next_emit 取下一帧。返回 NULL 表示全部结束。
+ * 序号无空洞 (pkt_q 用阻塞push, 分配序号后绝不丢), 故缺帧只可能是"还没解出来"。 */
+static AVFrame *reorder_next(Reorder *r, int64_t *out_seq)
+{
+    pthread_mutex_lock(&r->mu);
+    for (;;) {
+        int i, found = -1;
+        for (i = 0; i < r->cap; i++)
+            if (r->seq[i] == r->next_emit) { found = i; break; }
+        if (found >= 0) {
+            AVFrame *f = r->frm[found];
+            *out_seq = r->seq[found];
+            r->seq[found] = -1;
+            r->frm[found] = NULL;
+            r->count--;
+            r->next_emit++;
+            pthread_cond_signal(&r->can_insert);
+            pthread_mutex_unlock(&r->mu);
+            return f;
+        }
+        if (r->producers == 0 && r->count == 0) {     /* 全部解码worker已退出且取空 */
+            pthread_mutex_unlock(&r->mu);
+            return NULL;
+        }
+        pthread_cond_wait(&r->can_emit, &r->mu);
+    }
+}
+
+/* ---------------- 解码 worker 线程 ---------------- */
+typedef struct {
+    RingBuffer  *pkt_q;
+    Reorder     *reorder;
+    const AVCodec *dec;
+    AVCodecParameters *par;
+    const char  *tag;
+    int64_t      prof_decode, prof_n;   /* 本worker累计解码耗时 */
+} DecodeWorkerArg;
+
+static void *decode_worker(void *varg)
+{
+    DecodeWorkerArg *a = (DecodeWorkerArg *)varg;
+    AVCodecContext *dctx = avcodec_alloc_context3(a->dec);
+    avcodec_parameters_to_context(dctx, a->par);
+    if (avcodec_open2(dctx, a->dec, NULL) < 0) {
+        fprintf(stderr, "[解码%s] 打开解码器失败\n", a->tag ? a->tag : "");
+        /* 抽干自己这份不可能, 直接标记退出 */
+        reorder_producer_done(a->reorder);
+        avcodec_free_context(&dctx);
+        return NULL;
+    }
+
+    void *pitem;
+    while (rb_pop(a->pkt_q, &pitem) == 0) {
+        PktItem *pi = (PktItem *)pitem;
+        int64_t ts0 = av_gettime_relative();
+        int ret = avcodec_send_packet(dctx, pi->pkt);
+        if (ret >= 0) {
+            AVFrame *frame = av_frame_alloc();
+            if (avcodec_receive_frame(dctx, frame) == 0) {
+                a->prof_decode += av_gettime_relative() - ts0;
+                a->prof_n++;
+                reorder_insert(a->reorder, pi->seq, frame);   /* 所有权移交重排缓冲 */
+            } else {
+                av_frame_free(&frame);
+            }
+        }
+        packet_item_free(pi);
+    }
+
+    avcodec_free_context(&dctx);
+    reorder_producer_done(a->reorder);
+    return NULL;
+}
+
+/* ---------------- 收集线程: 按序取帧 -> IMU/CSV -> 克隆推入两路编码队列 ---- */
+typedef struct {
+    Reorder    *reorder;
+    RingBuffer *rb_l, *rb_r;
+    int         no_imu;
+    FILE       *frames_csv, *imu_csv;
+    int64_t     t_start;
+    /* 输出统计 */
+    int64_t frame_idx, n_decoded_imu, n_fail_imu, first_cam_ts, last_cam_ts;
+    int64_t prof_imu, prof_clone, prof_n;
+} CollectorArg;
+
+static void *collector_thread(void *varg)
+{
+    CollectorArg *a = (CollectorArg *)varg;
+    Unwrap32 uw_frame = {0}, uw_imu = {0};
+    int flip = 0, flip_detected = a->no_imu;
+    a->first_cam_ts = -1; a->last_cam_ts = -1;
+
+    AVFrame *frame;
+    int64_t seq;
+    while ((frame = reorder_next(a->reorder, &seq)) != NULL) {
+        double host_t = (av_gettime_relative() - a->t_start) / 1e6;
+        int64_t ts0 = av_gettime_relative();
+
+        /* ---- IMU / 时间戳: 用整帧 Y 平面解码 (按序, unwrap 状态正确) ---- */
+        if (!a->no_imu) {
+            FrameMeta meta;
+            if (!flip_detected) {
+                if (icm_decode_plane(frame->data[0], frame->width, frame->height,
+                                     frame->linesize[0], AFS_4G, GFS_1000DPS, 0, &meta)) {
+                    flip = 0; flip_detected = 1;
+                } else if (icm_decode_plane(frame->data[0], frame->width, frame->height,
+                                            frame->linesize[0], AFS_4G, GFS_1000DPS, 1, &meta)) {
+                    flip = 1; flip_detected = 1;
+                }
+                if (flip_detected)
+                    printf("[编码区方向] %s\n", flip ? "需翻转" : "无需翻转");
+            } else {
+                icm_decode_plane(frame->data[0], frame->width, frame->height,
+                                 frame->linesize[0], AFS_4G, GFS_1000DPS, flip, &meta);
+            }
+
+            if (meta.ok) {
+                a->n_decoded_imu++;
+                uint64_t exp_end = unwrap32(&uw_frame, meta.exp_time_end);
+                if (a->first_cam_ts < 0) a->first_cam_ts = exp_end;
+                a->last_cam_ts = exp_end;
+                if (a->frames_csv)
+                    fprintf(a->frames_csv, "%lld,%.6f,%u,%u,%u,%d\n",
+                            (long long)a->frame_idx, host_t,
+                            meta.exp_time_start, meta.exp_time_end,
+                            frame_exposure_us(&meta), meta.n_imu);
+                if (a->imu_csv)
+                    for (int k = 0; k < meta.n_imu; k++) {
+                        ImuSample *s = &meta.imu[k];
+                        fprintf(a->imu_csv,
+                                "%lld,%u,%llu,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f\n",
+                                (long long)a->frame_idx, meta.exp_time_end,
+                                (unsigned long long)unwrap32(&uw_imu, s->u_time),
+                                s->acc[0], s->acc[1], s->acc[2],
+                                s->gyro[0], s->gyro[1], s->gyro[2]);
+                    }
+            } else {
+                a->n_fail_imu++;
+            }
+        }
+        int64_t ts1 = av_gettime_relative();
+        a->prof_imu += ts1 - ts0;
+
+        /* ---- 把整幅解码帧「按引用」推入两路队列 ---- */
+        AVFrame *fl = av_frame_clone(frame);
+        AVFrame *fr = av_frame_clone(frame);
+        if (fl) {
+            FrameItem *it = malloc(sizeof(*it));
+            it->frame = fl; it->frame_idx = a->frame_idx;
+            if (rb_push(a->rb_l, it) < 0) frame_item_free(it);
+        }
+        if (fr) {
+            FrameItem *it = malloc(sizeof(*it));
+            it->frame = fr; it->frame_idx = a->frame_idx;
+            if (rb_push(a->rb_r, it) < 0) frame_item_free(it);
+        }
+        a->prof_clone += av_gettime_relative() - ts1;
+        a->prof_n++;
+        a->frame_idx++;
+        av_frame_free(&frame);   /* 释放重排缓冲交来的所有权 */
+    }
+
+    /* 关闭下游, 让编码线程优雅收尾 */
+    rb_close(a->rb_l);
+    rb_close(a->rb_r);
+    return NULL;
+}
+
 /* ---------------- 全局停止标志 (Ctrl+C) ---------------- */
 static volatile sig_atomic_t g_stop = 0;
 static void on_sigint(int s) { (void)s; g_stop = 1; }
@@ -157,6 +482,7 @@ typedef struct {
     int bitrate_kbps;
     double seconds;
     int queue_cap;
+    int dec_threads;      /* 并行 MJPEG 解码器实例数 (0=自动) */
     int no_imu;
 } Config;
 
@@ -172,7 +498,8 @@ static void usage(const char *prog)
     printf("  --bitrate KBPS  目标码率 kbps (默认 20000)\n");
     printf("  --seconds S     录制时长秒 (默认 10; 0=直到 Ctrl+C)\n");
     printf("  --out DIR       输出目录 (默认 out)\n");
-    printf("  --queue N       每路环形队列容量 (默认 8)\n");
+    printf("  --queue N       每路环形队列容量 (默认 64)\n");
+    printf("  --dec-threads N 并行 MJPEG 解码器实例数 (默认 0=自动, 取 4)\n");
     printf("  --no-imu        不解码 IMU / 不写 CSV\n");
     printf("  --list          列出 dshow 视频设备后退出\n");
 }
@@ -209,7 +536,8 @@ int main(int argc, char **argv)
     cfg.fps = 60;
     cfg.bitrate_kbps = 20000;
     cfg.seconds = 10.0;
-    cfg.queue_cap = 8;
+    cfg.queue_cap = 64;
+    cfg.dec_threads = 0;
     cfg.no_imu = 0;
 
     for (int i = 1; i < argc; i++) {
@@ -223,6 +551,7 @@ int main(int argc, char **argv)
         else if (!strcmp(argv[i], "--seconds") && i + 1 < argc) cfg.seconds = atof(argv[++i]);
         else if (!strcmp(argv[i], "--out") && i + 1 < argc) strcpy(cfg.out_dir, argv[++i]);
         else if (!strcmp(argv[i], "--queue") && i + 1 < argc) cfg.queue_cap = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--dec-threads") && i + 1 < argc) cfg.dec_threads = atoi(argv[++i]);
         else if (!strcmp(argv[i], "--no-imu")) cfg.no_imu = 1;
         else if (!strcmp(argv[i], "--list")) return list_devices();
         else if (!strcmp(argv[i], "-h") || !strcmp(argv[i], "--help")) { usage(argv[0]); return 0; }
@@ -272,11 +601,9 @@ int main(int argc, char **argv)
 
     AVCodecParameters *par = ifc->streams[vstream]->codecpar;
     const AVCodec *dec = avcodec_find_decoder(par->codec_id);
-    AVCodecContext *dctx = avcodec_alloc_context3(dec);
-    avcodec_parameters_to_context(dctx, par);
-    if (avcodec_open2(dctx, dec, NULL) < 0) {
-        fprintf(stderr, "打开解码器失败\n"); return 2;
-    }
+    if (!dec) { fprintf(stderr, "找不到解码器\n"); return 2; }
+    /* 注意: 不再开"一个"共享解码器。MJPEG 单线程解码 ~32ms/帧 是硬瓶颈,
+     * 改为下面 N 个独立解码器实例并行 (帧内编码各帧独立)。 */
     printf("[相机] %s  请求 %dx%d@%d MJPEG\n", cfg.device, cfg.width, cfg.height, cfg.fps);
 
     /* ---------- 准备输出目录 / CSV ---------- */
@@ -298,16 +625,35 @@ int main(int argc, char **argv)
             fprintf(imu_csv, "frame_idx,cam_exp_end_us,imu_t_us,acc_x_mg,acc_y_mg,acc_z_mg,gyro_x_dps,gyro_y_dps,gyro_z_dps\n");
     }
 
-    /* ---------- 左右环形队列 + 对称编码线程 ---------- */
+    /* ---------- 流水线: 采集(主) -> N×解码 -> 重排 -> 收集 -> 左右编码 ---------- */
     /* 整幅布局: [code_width 编码区][sensor_w 左][sensor_w 右]
      * 左图列区间 [code_width, code_width+sensor_w), 右图 [code_width+sensor_w, width) */
     int left_xoff = cfg.code_width;
     int right_xoff = cfg.code_width + sensor_w;
-    RingBuffer *rb_l = rb_create(cfg.queue_cap, frame_item_free);
-    RingBuffer *rb_r = rb_create(cfg.queue_cap, frame_item_free);
 
-    EncoderThreadArg arg_l = {0}, arg_r = {0};
-    arg_l.rb = rb_l; arg_r.rb = rb_r;
+    int num_dec = cfg.dec_threads > 0 ? cfg.dec_threads : 4;  /* 默认 4 路并行解码: 解码等效~8ms,
+                                                              * 给热降频留足余量, 实测零丢帧 */
+    /* 重排窗口必须 > 最大乱序跨度 (pkt_q 容量 + 解码线程数), 否则可能死锁 */
+    int reorder_cap = cfg.queue_cap + num_dec + 8;
+    printf("[并行解码] %d 个独立 MJPEG 解码器实例, 重排窗口=%d\n", num_dec, reorder_cap);
+
+    RingBuffer *pkt_q = rb_create(cfg.queue_cap, packet_item_free);  /* 采集->解码 */
+    /* 收集->转换: 整幅引用队列 (容量小即可, 稳态接近空); 转换->编码: NV12 队列 */
+    RingBuffer *rb_l = rb_create(16, frame_item_free);              /* 收集->左转换(整幅) */
+    RingBuffer *rb_r = rb_create(16, frame_item_free);              /* 收集->右转换(整幅) */
+    RingBuffer *nv_l = rb_create(cfg.queue_cap, frame_item_free);   /* 左转换->左编码(NV12) */
+    RingBuffer *nv_r = rb_create(cfg.queue_cap, frame_item_free);   /* 右转换->右编码(NV12) */
+    Reorder *reorder = reorder_create(reorder_cap, num_dec);
+
+    ConvertArg cvt_l = {0}, cvt_r = {0};
+    cvt_l.in = rb_l; cvt_l.out = nv_l; cvt_l.x_off = left_xoff;
+    cvt_r.in = rb_r; cvt_r.out = nv_r; cvt_r.x_off = right_xoff;
+    cvt_l.width = cvt_r.width = sensor_w;
+    cvt_l.height = cvt_r.height = cfg.height;
+    cvt_l.tag = "左"; cvt_r.tag = "右";
+
+    EncodeArg arg_l = {0}, arg_r = {0};
+    arg_l.in = nv_l; arg_r.in = nv_r;
     strcpy(arg_l.enc_name, cfg.enc_name); strcpy(arg_r.enc_name, cfg.enc_name);
     snprintf(arg_l.out_path, sizeof(arg_l.out_path), "%s/left.hevc", cfg.out_dir);
     snprintf(arg_r.out_path, sizeof(arg_r.out_path), "%s/right.hevc", cfg.out_dir);
@@ -317,20 +663,31 @@ int main(int argc, char **argv)
     arg_l.bitrate_kbps = arg_r.bitrate_kbps = cfg.bitrate_kbps;
     arg_l.tag = "左"; arg_r.tag = "右";
 
-    pthread_t th_l, th_r;
-    pthread_create(&th_l, NULL, encoder_thread, &arg_l);
-    pthread_create(&th_r, NULL, encoder_thread, &arg_r);
-
-    /* ---------- 采集主循环 ---------- */
-    struct SwsContext *sws = NULL;   /* yuv420p(半幅) -> nv12, 延迟到拿到首帧格式再建 */
-    AVPacket *pkt = av_packet_alloc();
-    AVFrame *frame = av_frame_alloc();
-
-    Unwrap32 uw_frame = {0}, uw_imu = {0};
-    int flip = 0, flip_detected = cfg.no_imu;  /* no-imu 时不需要方向探测 */
-    int64_t frame_idx = 0, n_decoded_imu = 0, n_fail_imu = 0;
     int64_t t_start = av_gettime_relative();
-    int64_t first_cam_ts = -1, last_cam_ts = -1;
+
+    CollectorArg carg = {0};
+    carg.reorder = reorder; carg.rb_l = rb_l; carg.rb_r = rb_r;
+    carg.no_imu = cfg.no_imu;
+    carg.frames_csv = frames_csv; carg.imu_csv = imu_csv;
+    carg.t_start = t_start;
+
+    DecodeWorkerArg *dargs = calloc(num_dec, sizeof(*dargs));
+    pthread_t *th_dec = calloc(num_dec, sizeof(*th_dec));
+    pthread_t th_cvt_l, th_cvt_r, th_enc_l, th_enc_r, th_col;
+    pthread_create(&th_enc_l, NULL, encode_thread, &arg_l);
+    pthread_create(&th_enc_r, NULL, encode_thread, &arg_r);
+    pthread_create(&th_cvt_l, NULL, convert_thread, &cvt_l);
+    pthread_create(&th_cvt_r, NULL, convert_thread, &cvt_r);
+    pthread_create(&th_col, NULL, collector_thread, &carg);
+    for (int i = 0; i < num_dec; i++) {
+        dargs[i].pkt_q = pkt_q; dargs[i].reorder = reorder;
+        dargs[i].dec = dec; dargs[i].par = par;
+        pthread_create(&th_dec[i], NULL, decode_worker, &dargs[i]);
+    }
+
+    /* ---------- 采集主循环: 只读 USB 包, 阻塞入解码队列 (分配序号后绝不丢) ---------- */
+    AVPacket *pkt = av_packet_alloc();
+    int64_t prof_read = 0, prof_read_n = 0, read_seq = 0;
 
     printf("[开始采集] 时长=%.1fs%s ...\n", cfg.seconds,
            cfg.seconds <= 0 ? " (Ctrl+C 停止)" : "");
@@ -340,117 +697,65 @@ int main(int argc, char **argv)
             (av_gettime_relative() - t_start) / 1e6 >= cfg.seconds)
             break;
 
+        int64_t ts0 = av_gettime_relative();
         ret = av_read_frame(ifc, pkt);
         if (ret < 0)
             break;
+        int64_t ts1 = av_gettime_relative();
+        prof_read += ts1 - ts0; prof_read_n++;
         if (pkt->stream_index != vstream) { av_packet_unref(pkt); continue; }
 
-        ret = avcodec_send_packet(dctx, pkt);
-        av_packet_unref(pkt);
-        if (ret < 0)
-            continue;
+        /* 把这一包的所有权移交给带序号的 PktItem, 阻塞推入解码队列 */
+        PktItem *pi = malloc(sizeof(*pi));
+        pi->pkt = av_packet_alloc();
+        av_packet_move_ref(pi->pkt, pkt);
+        pi->seq = read_seq++;
+        if (rb_push_block(pkt_q, pi) < 0)
+            packet_item_free(pi);
 
-        while (avcodec_receive_frame(dctx, frame) == 0) {
-            double host_t = (av_gettime_relative() - t_start) / 1e6;
-
-            /* ---- 首帧建 sws (源像素格式来自解码器) ---- */
-            if (!sws) {
-                sws = sws_getContext(sensor_w, cfg.height, dctx->pix_fmt,
-                                     sensor_w, cfg.height, AV_PIX_FMT_NV12,
-                                     SWS_BILINEAR, NULL, NULL, NULL);
-                if (!sws) { fprintf(stderr, "sws_getContext 失败\n"); g_stop = 1; break; }
-            }
-
-            /* ---- IMU / 时间戳: 用整帧 Y 平面解码 ---- */
-            if (!cfg.no_imu) {
-                FrameMeta meta;
-                if (!flip_detected) {
-                    if (icm_decode_plane(frame->data[0], frame->width, frame->height,
-                                         frame->linesize[0], AFS_4G, GFS_1000DPS, 0, &meta)) {
-                        flip = 0; flip_detected = 1;
-                    } else if (icm_decode_plane(frame->data[0], frame->width, frame->height,
-                                                frame->linesize[0], AFS_4G, GFS_1000DPS, 1, &meta)) {
-                        flip = 1; flip_detected = 1;
-                    }
-                    if (flip_detected)
-                        printf("[编码区方向] %s\n", flip ? "需翻转" : "无需翻转");
-                } else {
-                    icm_decode_plane(frame->data[0], frame->width, frame->height,
-                                     frame->linesize[0], AFS_4G, GFS_1000DPS, flip, &meta);
-                }
-
-                if (meta.ok) {
-                    n_decoded_imu++;
-                    uint64_t exp_end = unwrap32(&uw_frame, meta.exp_time_end);
-                    if (first_cam_ts < 0) first_cam_ts = exp_end;
-                    last_cam_ts = exp_end;
-                    if (frames_csv)
-                        fprintf(frames_csv, "%lld,%.6f,%u,%u,%u,%d\n",
-                                (long long)frame_idx, host_t,
-                                meta.exp_time_start, meta.exp_time_end,
-                                frame_exposure_us(&meta), meta.n_imu);
-                    if (imu_csv)
-                        for (int k = 0; k < meta.n_imu; k++) {
-                            ImuSample *s = &meta.imu[k];
-                            fprintf(imu_csv,
-                                    "%lld,%u,%llu,%.3f,%.3f,%.3f,%.4f,%.4f,%.4f\n",
-                                    (long long)frame_idx, meta.exp_time_end,
-                                    (unsigned long long)unwrap32(&uw_imu, s->u_time),
-                                    s->acc[0], s->acc[1], s->acc[2],
-                                    s->gyro[0], s->gyro[1], s->gyro[2]);
-                        }
-                } else {
-                    n_fail_imu++;
-                }
-            }
-
-            /* ---- 拆左右 -> NV12 -> 推入两路队列 ---- */
-            AVFrame *fl = make_half_nv12(sws, frame, left_xoff, sensor_w, cfg.height);
-            AVFrame *fr = make_half_nv12(sws, frame, right_xoff, sensor_w, cfg.height);
-            if (fl) {
-                fl->pts = frame_idx;
-                FrameItem *it = malloc(sizeof(*it));
-                it->frame = fl; it->frame_idx = frame_idx;
-                if (rb_push(rb_l, it) < 0) frame_item_free(it);
-            }
-            if (fr) {
-                fr->pts = frame_idx;
-                FrameItem *it = malloc(sizeof(*it));
-                it->frame = fr; it->frame_idx = frame_idx;
-                if (rb_push(rb_r, it) < 0) frame_item_free(it);
-            }
-
-            frame_idx++;
-            av_frame_unref(frame);
-
-            if (frame_idx % cfg.fps == 0) {
-                double el = (av_gettime_relative() - t_start) / 1e6;
-                printf("\r  采集中... 帧=%lld 平均fps=%.2f 队列L=%zu/R=%zu 丢弃L=%zu/R=%zu",
-                       (long long)frame_idx, frame_idx / (el > 0 ? el : 1),
-                       rb_size(rb_l), rb_size(rb_r),
-                       rb_dropped(rb_l), rb_dropped(rb_r));
-                fflush(stdout);
-            }
+        if (prof_read_n % cfg.fps == 0) {
+            double el = (av_gettime_relative() - t_start) / 1e6;
+            printf("\r  采集中... 读包=%lld 平均fps=%.2f 队列P=%zu/L=%zu/R=%zu 丢弃L=%zu/R=%zu",
+                   (long long)prof_read_n, prof_read_n / (el > 0 ? el : 1),
+                   rb_size(pkt_q), rb_size(rb_l), rb_size(rb_r),
+                   rb_dropped(rb_l), rb_dropped(rb_r));
+            fflush(stdout);
         }
     }
-    printf("\n[采集结束] 关闭队列, 等待编码线程冲刷...\n");
+    printf("\n[采集结束] 关闭队列, 等待解码 + 编码线程冲刷...\n");
 
-    /* ---------- 收尾 ---------- */
-    rb_close(rb_l);
-    rb_close(rb_r);
-    pthread_join(th_l, NULL);
-    pthread_join(th_r, NULL);
+    /* ---------- 收尾: 关 pkt 队列 -> 解码worker -> 收集 -> 转换 -> 编码 逐级收尾 ---- */
+    rb_close(pkt_q);
+    for (int i = 0; i < num_dec; i++)
+        pthread_join(th_dec[i], NULL);
+    pthread_join(th_col, NULL);          /* 收集退出时关闭 rb_l/rb_r */
+    pthread_join(th_cvt_l, NULL);        /* 转换退出时关闭 nv_l/nv_r */
+    pthread_join(th_cvt_r, NULL);
+    pthread_join(th_enc_l, NULL);
+    pthread_join(th_enc_r, NULL);
 
     double elapsed = (av_gettime_relative() - t_start) / 1e6;
-    av_frame_free(&frame);
+    int64_t frame_idx = carg.frame_idx;
+    int64_t n_decoded_imu = carg.n_decoded_imu, n_fail_imu = carg.n_fail_imu;
+    int64_t first_cam_ts = carg.first_cam_ts, last_cam_ts = carg.last_cam_ts;
+    int64_t prof_decode_sum = 0, prof_decode_n = 0;
+    for (int i = 0; i < num_dec; i++) {
+        prof_decode_sum += dargs[i].prof_decode;
+        prof_decode_n   += dargs[i].prof_n;
+    }
+
     av_packet_free(&pkt);
-    if (sws) sws_freeContext(sws);
-    avcodec_free_context(&dctx);
     avformat_close_input(&ifc);
     if (frames_csv) fclose(frames_csv);
     if (imu_csv) fclose(imu_csv);
+    rb_destroy(pkt_q);
     rb_destroy(rb_l);
     rb_destroy(rb_r);
+    rb_destroy(nv_l);
+    rb_destroy(nv_r);
+    reorder_destroy(reorder);
+    free(dargs);
+    free(th_dec);
 
     /* ---------- 统计 ---------- */
     printf("\n========== 结果 ==========\n");
@@ -463,10 +768,30 @@ int main(int argc, char **argv)
     if (!cfg.no_imu)
         printf("IMU 解码      : 成功 %lld / 失败 %lld\n",
                (long long)n_decoded_imu, (long long)n_fail_imu);
-    printf("左路编码      : %s, 写出 %ld 帧 -> %s/left.hevc (丢弃 %zu)\n",
-           arg_l.ok ? "OK" : "失败", arg_l.frames, cfg.out_dir, rb_dropped(rb_l));
-    printf("右路编码      : %s, 写出 %ld 帧 -> %s/right.hevc (丢弃 %zu)\n",
-           arg_r.ok ? "OK" : "失败", arg_r.frames, cfg.out_dir, rb_dropped(rb_r));
+    printf("左路编码      : %s, 写出 %ld 帧 -> %s/left.hevc (丢弃 转换%zu/编码%zu)\n",
+           arg_l.ok ? "OK" : "失败", arg_l.frames, cfg.out_dir,
+           rb_dropped(rb_l), rb_dropped(nv_l));
+    printf("右路编码      : %s, 写出 %ld 帧 -> %s/right.hevc (丢弃 转换%zu/编码%zu)\n",
+           arg_r.ok ? "OK" : "失败", arg_r.frames, cfg.out_dir,
+           rb_dropped(rb_r), rb_dropped(nv_r));
+    printf("---- 各级平均耗时 (每帧, ms; 60fps 预算 16.67) ----\n");
+    if (prof_read_n > 0)
+        printf("  采集 USB读包 : %.2f\n", prof_read / 1000.0 / prof_read_n);
+    if (prof_decode_n > 0)
+        printf("  解码 %d路并行 : 单路 %.2f -> 等效 %.2f\n", num_dec,
+               prof_decode_sum / 1000.0 / prof_decode_n,
+               prof_decode_sum / 1000.0 / prof_decode_n / num_dec);
+    if (carg.prof_n > 0)
+        printf("  收集 IMU+克隆: %.2f\n",
+               (carg.prof_imu + carg.prof_clone) / 1000.0 / carg.prof_n);
+    if (cvt_l.prof_n > 0 && cvt_r.prof_n > 0)
+        printf("  转换 sws L/R : %.2f / %.2f\n",
+               cvt_l.prof_sws / 1000.0 / cvt_l.prof_n,
+               cvt_r.prof_sws / 1000.0 / cvt_r.prof_n);
+    if (arg_l.prof_n > 0 && arg_r.prof_n > 0)
+        printf("  编码 amf L/R : %.2f / %.2f\n",
+               arg_l.prof_enc / 1000.0 / arg_l.prof_n,
+               arg_r.prof_enc / 1000.0 / arg_r.prof_n);
     printf("\n下一步: 用 hevc2mp4 转 mp4:\n");
     printf("  ./hevc2mp4 %s/left.hevc  %s/left.mp4  %d\n", cfg.out_dir, cfg.out_dir, cfg.fps);
     printf("  ./hevc2mp4 %s/right.hevc %s/right.mp4 %d\n", cfg.out_dir, cfg.out_dir, cfg.fps);
