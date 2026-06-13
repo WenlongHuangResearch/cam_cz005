@@ -1,0 +1,42 @@
+name: ci
+
+on:
+  push:
+    branches:
+      - main
+      - master
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  windows-msys2:
+    name: Windows MSYS2 build
+    runs-on: windows-latest
+
+    defaults:
+      run:
+        shell: msys2 {0}
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v5
+
+      - name: Setup MSYS2
+        uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          update: true
+          install: >-
+            make
+            mingw-w64-x86_64-gcc
+            mingw-w64-x86_64-ffmpeg
+            mingw-w64-x86_64-pkgconf
+
+      - name: Build
+        run: make ci
+
+      - name: Upload binaries
+        uses: actions/upload-artifact@v7
+        with:
+          name: stereo-recorder-windows-mingw64
+          path: apps/stereo-recorder/build/bin/

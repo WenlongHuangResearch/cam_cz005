@@ -18,9 +18,11 @@ echo "===== hevc 编码器 ====="
 ffmpeg -hide_banner -encoders 2>/dev/null | grep -i hevc || true
 
 echo "===== 编译 ====="
-cd "$(dirname "$0")"
+SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
+APP_DIR="$(cd "$SCRIPT_DIR/.." && pwd)"
+cd "$APP_DIR"
 make clean
 make
 
 echo "===== 产物 ====="
-ls -l stereo_record.exe hevc2mp4.exe
+ls -l build/bin

@@ -2,7 +2,7 @@
 
 #include <string.h>
 
-/* ---- 编码参数 (同厂商 demo / Python 版) ---- */
+/* ---- 编码参数 (同厂商 demo) ---- */
 #define GROUP_DT_SIZE 16     /* 每组字节数 */
 #define CODE_VSIZE    8      /* 编码块高 (行步进) */
 #define CODE_USIZE    8      /* 编码块宽 (列步进) */

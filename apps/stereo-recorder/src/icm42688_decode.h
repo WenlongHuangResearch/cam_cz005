@@ -1,8 +1,7 @@
 /*
  * icm42688_decode.h —— 从图像底部"编码区"解出帧曝光时间戳 + IMU 采样。
  *
- * 移植自厂商 TimeStamp_Data_Decode_DemoCode (icm_decode.cpp / icm42688_decode.h),
- * 与本仓库 Python 版 tst_decode.py 等价。
+ * 移植自厂商 TimeStamp_Data_Decode_DemoCode (icm_decode.cpp / icm42688_decode.h)。
  *
  * 编码区规则 (Nori 3D Camera User Guide 第 6 节):
  *   - 每帧 12 组, 每组 16 字节; 8x8 黑白块编码。

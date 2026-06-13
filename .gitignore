@@ -6,8 +6,13 @@ venv/
 *.egg-info/
 
 # ===== 程序输出 =====
+/artifacts/
 out/
 *.csv
+
+# ===== 构建输出 =====
+/build/
+build/
 
 # ===== 录制 / 媒体产物 (体积大, 不入库) =====
 recordings/
@@ -16,6 +21,7 @@ recordings/
 *.h265
 *.bmp
 *.png
+!/vendor/**/*.bmp
 
 # ===== Visual Studio / C++ 构建产物 =====
 x64/

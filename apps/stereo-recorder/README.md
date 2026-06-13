@@ -61,6 +61,11 @@ src/
   encoder.[ch]           HEVC 编码器封装 (默认 hevc_amf)
   capture_record.c       采集主程序 (采集线程 + 双队列 + 双编码线程 + CSV)
   hevc_to_mp4.c          .hevc -> .mp4 remux 工具
+scripts/
+  build.sh               构建脚本
+  install_build.sh       安装 MSYS2 依赖并构建
+  record_session.sh      录制一组数据并转 MP4
+  verify.sh              检查录制输出
 Makefile
 ```
 
@@ -83,11 +88,11 @@ pacman -S --needed mingw-w64-x86_64-gcc mingw-w64-x86_64-ffmpeg \
 在 **MSYS2 MINGW64** 终端（不是普通 cmd / MSYS 终端）里：
 
 ```bash
-cd /c/code/cam_cz005/stereo_imu_sync_c
+cd /c/code/cam_cz005/apps/stereo-recorder
 make
 ```
 
-生成 `stereo_record.exe` 和 `hevc2mp4.exe`。
+生成 `build/bin/stereo_record.exe` 和 `build/bin/hevc2mp4.exe`。
 
 > 直接在 PowerShell 里跑这两个 exe 也行，但要先把 `C:\msys64\mingw64\bin`
 > 加进 `PATH`（否则找不到 `avcodec-*.dll` 等运行时库）。
@@ -96,16 +101,16 @@ make
 
 ```bash
 # 列出 dshow 视频设备 (确认设备名)
-./stereo_record --list
+./build/bin/stereo_record --list
 
 # 录 10 秒: 双路 H265 + IMU 同步 CSV, 输出到 out/
-./stereo_record --seconds 10 --out out
+./build/bin/stereo_record --seconds 10 --out out
 
 # 一直录到 Ctrl+C, 指定设备名与码率
-./stereo_record --seconds 0 --bitrate 30000 --device "DECXIN Camera, UsbStr12"
+./build/bin/stereo_record --seconds 0 --bitrate 30000 --device "DECXIN Camera, UsbStr12"
 
 # 没有 AMD 硬件编码时可退回软件编码 (4000x1200@60 实时可能跟不上)
-./stereo_record --encoder libx265
+./build/bin/stereo_record --encoder libx265
 ```
 
 主要参数：
@@ -127,8 +132,8 @@ make
 ## 转 MP4
 
 ```bash
-./hevc2mp4 out/left.hevc  out/left.mp4  60
-./hevc2mp4 out/right.hevc out/right.mp4 60
+./build/bin/hevc2mp4 out/left.hevc  out/left.mp4  60
+./build/bin/hevc2mp4 out/right.hevc out/right.mp4 60
 ```
 
 ## 输出
