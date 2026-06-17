@@ -20,6 +20,10 @@ ifneq (,$(findstring MINGW,$(UNAME_S)))
 EXEEXT ?= .exe
 else
 EXEEXT ?=
+ifneq (,$(shell $(PKG_CONFIG) --exists rockchip_mpp && echo yes))
+CFLAGS += $(shell $(PKG_CONFIG) --cflags rockchip_mpp)
+LDLIBS += $(shell $(PKG_CONFIG) --libs rockchip_mpp)
+endif
 endif
 
 BIN_REC = $(BIN_DIR)/stereo_record$(EXEEXT)

@@ -27,17 +27,18 @@ C 实现，基于 FFmpeg 的 `libav*` 库。为吃满 **60fps**，整条链路�
                                         left.hevc                right.hevc
 ```
 
-- **采集主线程**：dshow 取流 `4000×1200 MJPG@60`，只做 USB 读包并按序号阻塞入队，
-  天然按 60fps 节流；分配序号后绝不丢包（重排无空洞），过载时由上游 dshow 缓冲兜底。
+- **采集主线程**：Windows 用 dshow、Linux/Orange Pi 用 v4l2 取流
+  `4000×1200 MJPG@60`，只做 USB 读包并按序号阻塞入队，天然按 60fps 节流；
+  分配序号后绝不丢包（重排无空洞），过载时由上游缓冲兜底。
 - **N 个独立 MJPEG 解码器实例**（默认 4，`--dec-threads` 可调）：MJPEG 帧内编码各帧
   独立，可完美并行。单线程解码 4000×1200 约 32ms（远超 16.67ms 预算），多实例并行后
   解码等效 ~6–8ms。
 - **重排缓冲**：解码乱序完成后按采集序号还原顺序。
 - **收集线程**：按序解出 **帧曝光时间戳 + IMU**（写 CSV），把整幅解码帧「按引用」
   （`av_frame_clone`，不拷像素）分发到左右两路。
-- **左右各两级**：转换线程做「切半幅 + yuvj420p→NV12」（sws，约 6ms），编码线程用
-  **AMD 硬件编码 `hevc_amf`** 编 H.265（约 4ms）。sws 与编码拆成两级，各自都在
-  预算内，长录不丢帧。
+- **左右各两级**：转换线程做「切半幅 + yuvj420p→NV12」（sws），编码线程用
+  硬件 H.265（Windows 默认 `hevc_amf`，Orange Pi/Linux 默认 `hevc_mpp`）。sws 与编码
+  拆成两级，各自都在预算内，长录不丢帧。
 - 各下游队列用「队满丢最旧帧」策略，互不阻塞。
 - 独立程序 `hevc2mp4`：把 `.hevc` 裸流 **remux 成 `.mp4`**（stream copy，无损、秒级）。
 
@@ -58,7 +59,7 @@ C 实现，基于 FFmpeg 的 `libav*` 库。为吃满 **60fps**，整条链路�
 src/
   ring_buffer.[ch]       通用线程安全环形队列 (队满丢最旧帧)
   icm42688_decode.[ch]   底部编码区 -> 帧曝光时间戳 + IMU (移植自厂商 demo)
-  encoder.[ch]           HEVC 编码器封装 (默认 hevc_amf)
+  encoder.[ch]           HEVC 编码器封装 (Windows hevc_amf / Orange Pi hevc_mpp)
   capture_record.c       采集主程序 (采集线程 + 双队列 + 双编码线程 + CSV)
   hevc_to_mp4.c          .hevc -> .mp4 remux 工具
 scripts/
@@ -121,7 +122,7 @@ make
 | `--width/--height` | `4000/1200` | 整幅尺寸 |
 | `--code-width` | `160` | 左侧编码区宽度，切图时跳过；左右各 `(宽-它)/2` |
 | `--fps` | `60` | 帧率 |
-| `--encoder` | `hevc_amf` | 编码器（可选 `libx265`） |
+| `--encoder` | Windows: `hevc_amf`; Linux: `hevc_mpp` | 编码器（可选 `libx265`，实时可能跟不上） |
 | `--bitrate` | `20000` | 每路目标码率 kbps |
 | `--seconds` | `10` | 录制时长，`0` = 到 Ctrl+C |
 | `--out` | `out` | 输出目录 |

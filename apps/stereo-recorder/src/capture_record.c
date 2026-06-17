@@ -3,13 +3,13 @@
  *
  * 流水线 (生产者-消费者, 环形队列解耦):
  *
- *   [采集线程]  dshow 取 4000x1200 MJPG@60 -> 解码成 YUV
+ *   [采集线程]  dshow/v4l2 取 4000x1200 MJPG@60 -> 解码成 YUV
  *               -> 整帧 Y 平面解出 帧曝光时间戳 + IMU (写 CSV)
  *               -> 把整帧按宽度切成 左半 / 右半, 各转成 NV12
  *               -> 分别 push 进 左/右两个环形队列
  *                         |                         |
  *   [左编码线程] <--------+        [右编码线程] <----+
- *     pop -> hevc_amf 编码 -> left.hevc    pop -> hevc_amf 编码 -> right.hevc
+ *     pop -> HEVC 编码 -> left.hevc        pop -> HEVC 编码 -> right.hevc
  *
  * "对称": 左右两路是完全对称的两个独立队列 + 编码线程, 互不影响。
  * 采集线程用 rb_push (队满丢最旧帧) 永不被慢编码器阻塞, 保证 USB 不丢帧。
@@ -71,13 +71,14 @@ static void packet_item_free(void *p)
     free(it);
 }
 
-/* 把整帧某半幅 (yuv420p) 转成 NV12 半幅帧 (定义在下方) */
-static AVFrame *make_half_nv12(struct SwsContext *sws, const AVFrame *src,
-                               int x_off, int half_w, int height);
+/* 把整帧某半幅转成编码器需要的像素格式 (定义在下方) */
+static AVFrame *make_half_frame(struct SwsContext *sws, const AVFrame *src,
+                                int x_off, int half_w, int height,
+                                enum AVPixelFormat dst_fmt);
 
 /* ============================================================================
- *  每一路 (左/右) 拆成两级流水线: [转换线程 sws] -> [nv12队列] -> [编码线程 amf]
- *  sws(~12ms) 与 amf编码(~8ms) 串在一条线程里会超 60fps 预算(16.67ms)、长录丢帧;
+ *  每一路 (左/右) 拆成两级流水线: [转换线程 sws] -> [编码输入队列] -> [编码线程]
+ *  sws 与编码串在一条线程里会超 60fps 预算(16.67ms)、长录丢帧;
  *  拆成两级后各级单独都在预算内, 可持续 60fps。
  * ========================================================================== */
 
@@ -86,6 +87,7 @@ typedef struct {
     RingBuffer *in;       /* 上游: 整幅解码帧引用 (FrameItem) */
     RingBuffer *out;      /* 下游: 本路 NV12 半幅帧 (FrameItem) */
     int width, height, x_off;
+    enum AVPixelFormat dst_fmt;
     const char *tag;
     int64_t prof_sws, prof_n;
 } ConvertArg;
@@ -111,7 +113,7 @@ static void *convert_thread(void *varg)
         FrameItem *it = (FrameItem *)item;
         if (!sws) {
             sws = sws_getContext(a->width, a->height, dejpeg_fmt(it->frame->format),
-                                 a->width, a->height, AV_PIX_FMT_NV12,
+                                 a->width, a->height, a->dst_fmt,
                                  SWS_POINT, NULL, NULL, NULL);
             if (!sws) {
                 fprintf(stderr, "[%s转换] sws_getContext 失败\n", a->tag);
@@ -120,13 +122,14 @@ static void *convert_thread(void *varg)
             }
         }
         int64_t ts0 = av_gettime_relative();
-        AVFrame *nv12 = make_half_nv12(sws, it->frame, a->x_off, a->width, a->height);
+        AVFrame *out = make_half_frame(sws, it->frame, a->x_off, a->width,
+                                       a->height, a->dst_fmt);
         a->prof_sws += av_gettime_relative() - ts0;
         a->prof_n++;
-        if (nv12) {
-            nv12->pts = it->frame_idx;
+        if (out) {
+            out->pts = it->frame_idx;
             FrameItem *oit = malloc(sizeof(*oit));
-            oit->frame = nv12; oit->frame_idx = it->frame_idx;
+            oit->frame = out; oit->frame_idx = it->frame_idx;
             if (rb_push(a->out, oit) < 0) frame_item_free(oit);
         }
         frame_item_free(it);
@@ -136,12 +139,13 @@ static void *convert_thread(void *varg)
     return NULL;
 }
 
-/* ---------------- 编码线程: 取 NV12 -> hevc_amf 编码 -> 写裸流 ---- */
+/* ---------------- 编码线程: 取 NV12 -> HEVC 编码 -> 写裸流 ---- */
 typedef struct {
     RingBuffer *in;       /* 上游: NV12 半幅帧 (FrameItem) */
     char enc_name[64];
     char out_path[512];
     int width, height, fps, bitrate_kbps;
+    enum AVPixelFormat pix_fmt;
     const char *tag;
     int ok;
     long frames;
@@ -153,7 +157,8 @@ static void *encode_thread(void *varg)
     EncodeArg *a = (EncodeArg *)varg;
     char err[256] = {0};
     Encoder *enc = encoder_create(a->enc_name, a->width, a->height, a->fps,
-                                  a->bitrate_kbps, a->out_path, err, sizeof(err));
+                                  a->pix_fmt, a->bitrate_kbps, a->out_path,
+                                  err, sizeof(err));
     if (!enc) {
         fprintf(stderr, "[%s编码] 创建编码器失败: %s\n", a->tag, err);
         void *item;
@@ -196,15 +201,16 @@ static uint64_t unwrap32(Unwrap32 *u, uint32_t v)
     return u->base + v;
 }
 
-/* ---------------- 把整帧某半幅 (yuv420p) 转成 NV12 半幅帧 ---------------- */
-/* x_off: 该半幅在整帧中的起始列 (0 或 width/2)。返回新分配的 NV12 AVFrame。 */
-static AVFrame *make_half_nv12(struct SwsContext *sws, const AVFrame *src,
-                               int x_off, int half_w, int height)
+/* ---------------- 把整帧某半幅转成编码器输入帧 ---------------- */
+/* x_off: 该半幅在整帧中的起始列。返回新分配的 AVFrame。 */
+static AVFrame *make_half_frame(struct SwsContext *sws, const AVFrame *src,
+                                int x_off, int half_w, int height,
+                                enum AVPixelFormat dst_fmt)
 {
     AVFrame *dst = av_frame_alloc();
     if (!dst)
         return NULL;
-    dst->format = AV_PIX_FMT_NV12;
+    dst->format = dst_fmt;
     dst->width = half_w;
     dst->height = height;
     if (av_frame_get_buffer(dst, 32) < 0) {
@@ -489,24 +495,33 @@ typedef struct {
 static void usage(const char *prog)
 {
     printf("用法: %s [选项]\n", prog);
+#ifdef _WIN32
     printf("  --device NAME   dshow 设备名 (默认 \"DECXIN Camera\")\n");
+#else
+    printf("  --device PATH   v4l2 设备路径 (默认 /dev/video0)\n");
+#endif
     printf("  --width N       整幅宽 (默认 4000)\n");
     printf("  --height N      整幅高 (默认 1200)\n");
     printf("  --code-width N  左侧编码区宽度, 切图时跳过 (默认 160; 左右各 (宽-它)/2)\n");
     printf("  --fps N         帧率 (默认 60)\n");
+#ifdef _WIN32
     printf("  --encoder NAME  编码器 (默认 hevc_amf; 可选 libx265)\n");
+#else
+    printf("  --encoder NAME  编码器 (默认 hevc_mpp; 可选 libx265)\n");
+#endif
     printf("  --bitrate KBPS  目标码率 kbps (默认 20000)\n");
     printf("  --seconds S     录制时长秒 (默认 10; 0=直到 Ctrl+C)\n");
     printf("  --out DIR       输出目录 (默认 out)\n");
     printf("  --queue N       每路环形队列容量 (默认 64)\n");
     printf("  --dec-threads N 并行 MJPEG 解码器实例数 (默认 0=自动, 取 4)\n");
     printf("  --no-imu        不解码 IMU / 不写 CSV\n");
-    printf("  --list          列出 dshow 视频设备后退出\n");
+    printf("  --list          列出视频设备后退出\n");
 }
 
 static int list_devices(void)
 {
     avdevice_register_all();
+#ifdef _WIN32
     const AVInputFormat *ifmt = av_find_input_format("dshow");
     if (!ifmt) {
         fprintf(stderr, "找不到 dshow 输入设备 (ffmpeg 未带 dshow?)\n");
@@ -520,6 +535,11 @@ static int list_devices(void)
     av_dict_free(&opts);
     if (ctx)
         avformat_close_input(&ctx);
+#else
+    printf("== v4l2 设备列表 ==\n");
+    int rc = system("v4l2-ctl --list-devices 2>/dev/null || ls -l /dev/video* 2>/dev/null");
+    (void)rc;
+#endif
     return 0;
 }
 
@@ -527,8 +547,13 @@ int main(int argc, char **argv)
 {
     Config cfg;
     memset(&cfg, 0, sizeof(cfg));
+#ifdef _WIN32
     strcpy(cfg.device, "DECXIN Camera");
     strcpy(cfg.enc_name, "hevc_amf");
+#else
+    strcpy(cfg.device, "/dev/video0");
+    strcpy(cfg.enc_name, "hevc_mpp");
+#endif
     strcpy(cfg.out_dir, "out");
     cfg.width = 4000;
     cfg.height = 1200;
@@ -569,27 +594,39 @@ int main(int argc, char **argv)
     signal(SIGINT, on_sigint);
     avdevice_register_all();
 
-    /* ---------- 打开 dshow 相机 ---------- */
+    /* ---------- 打开相机 ---------- */
+#ifdef _WIN32
     const AVInputFormat *ifmt = av_find_input_format("dshow");
     if (!ifmt) { fprintf(stderr, "找不到 dshow 输入\n"); return 1; }
 
     char url[320];
     snprintf(url, sizeof(url), "video=%s", cfg.device);
+#else
+    const AVInputFormat *ifmt = av_find_input_format("v4l2");
+    if (!ifmt) { fprintf(stderr, "找不到 v4l2 输入\n"); return 1; }
+
+    char url[320];
+    snprintf(url, sizeof(url), "%s", cfg.device);
+#endif
     char sval[64];
     AVDictionary *iopts = NULL;
     snprintf(sval, sizeof(sval), "%dx%d", cfg.width, cfg.height);
     av_dict_set(&iopts, "video_size", sval, 0);
     snprintf(sval, sizeof(sval), "%d", cfg.fps);
     av_dict_set(&iopts, "framerate", sval, 0);
+#ifdef _WIN32
     av_dict_set(&iopts, "vcodec", "mjpeg", 0);    /* 4000x1200@60 必须 MJPEG */
     av_dict_set(&iopts, "rtbufsize", "512M", 0);
+#else
+    av_dict_set(&iopts, "input_format", "mjpeg", 0);    /* 4000x1200@60 必须 MJPEG */
+#endif
 
     AVFormatContext *ifc = NULL;
     int ret = avformat_open_input(&ifc, url, ifmt, &iopts);
     av_dict_free(&iopts);
     if (ret < 0) {
         char eb[128]; av_strerror(ret, eb, sizeof(eb));
-        fprintf(stderr, "打开相机失败: %s\n用 --list 查看设备名, 或确认相机未被占用。\n", eb);
+        fprintf(stderr, "打开相机失败: %s\n用 --list 查看设备, 或确认相机未被占用。\n", eb);
         return 2;
     }
     avformat_find_stream_info(ifc, NULL);
@@ -630,6 +667,9 @@ int main(int argc, char **argv)
      * 左图列区间 [code_width, code_width+sensor_w), 右图 [code_width+sensor_w, width) */
     int left_xoff = cfg.code_width;
     int right_xoff = cfg.code_width + sensor_w;
+    enum AVPixelFormat enc_pix_fmt = AV_PIX_FMT_NV12;
+    if (!strcmp(cfg.enc_name, "libx265"))
+        enc_pix_fmt = AV_PIX_FMT_YUV420P;
 
     int num_dec = cfg.dec_threads > 0 ? cfg.dec_threads : 4;  /* 默认 4 路并行解码: 解码等效~8ms,
                                                               * 给热降频留足余量, 实测零丢帧 */
@@ -650,6 +690,7 @@ int main(int argc, char **argv)
     cvt_r.in = rb_r; cvt_r.out = nv_r; cvt_r.x_off = right_xoff;
     cvt_l.width = cvt_r.width = sensor_w;
     cvt_l.height = cvt_r.height = cfg.height;
+    cvt_l.dst_fmt = cvt_r.dst_fmt = enc_pix_fmt;
     cvt_l.tag = "左"; cvt_r.tag = "右";
 
     EncodeArg arg_l = {0}, arg_r = {0};
@@ -660,6 +701,7 @@ int main(int argc, char **argv)
     arg_l.width = arg_r.width = sensor_w;
     arg_l.height = arg_r.height = cfg.height;
     arg_l.fps = arg_r.fps = cfg.fps;
+    arg_l.pix_fmt = arg_r.pix_fmt = enc_pix_fmt;
     arg_l.bitrate_kbps = arg_r.bitrate_kbps = cfg.bitrate_kbps;
     arg_l.tag = "左"; arg_r.tag = "右";
 
@@ -789,7 +831,7 @@ int main(int argc, char **argv)
                cvt_l.prof_sws / 1000.0 / cvt_l.prof_n,
                cvt_r.prof_sws / 1000.0 / cvt_r.prof_n);
     if (arg_l.prof_n > 0 && arg_r.prof_n > 0)
-        printf("  编码 amf L/R : %.2f / %.2f\n",
+        printf("  编码 L/R     : %.2f / %.2f\n",
                arg_l.prof_enc / 1000.0 / arg_l.prof_n,
                arg_r.prof_enc / 1000.0 / arg_r.prof_n);
     printf("\n下一步: 用 hevc2mp4 转 mp4:\n");

@@ -9,6 +9,7 @@
 #define ENCODER_H
 
 #include <libavutil/frame.h>
+#include <libavutil/pixfmt.h>
 
 typedef struct Encoder Encoder;
 
@@ -17,13 +18,14 @@ typedef struct Encoder Encoder;
  *   encoder_name : 编码器名, 如 "hevc_amf" / "libx265"
  *   width,height : 编码分辨率 (左右半幅各自的尺寸)
  *   fps          : 帧率
+ *   pix_fmt      : 输入帧像素格式
  *   bitrate_kbps : 目标码率 (kbps); <=0 时使用默认
  *   out_path     : 输出 .hevc 文件路径
  *   errbuf/errcap: 失败时写入错误描述
  * 成功返回 Encoder*; 失败返回 NULL。
  */
 Encoder *encoder_create(const char *encoder_name, int width, int height,
-                        int fps, int bitrate_kbps, const char *out_path,
+                        int fps, enum AVPixelFormat pix_fmt, int bitrate_kbps, const char *out_path,
                         char *errbuf, int errcap);
 
 /* 编码一帧 (NV12, pts 已设置), 内部把产生的包写入文件。返回 0 成功, <0 失败。 */

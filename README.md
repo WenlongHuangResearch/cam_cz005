@@ -14,6 +14,28 @@ build/                    本地构建缓存/旧二进制，默认不入库
 .github/workflows/        CI 配置
 ```
 
+## 一键运行
+
+从仓库根目录执行：
+
+```bash
+./run.sh
+```
+
+默认会自动构建缺失的程序，并开始持续采集；在 Orange Pi/Linux 上默认使用
+Rockchip MPP 硬件 H.265 编码。按 `Ctrl+C` 停止后会自动把左右 `.hevc` 转成 `.mp4`。
+也可以指定录制秒数：
+
+```bash
+./run.sh 10
+```
+
+录制输出默认写入：
+
+```text
+artifacts/stereo-recorder/recordings_run/
+```
+
 ## 构建
 
 推荐在 MSYS2 MINGW64 环境中构建：
@@ -33,12 +55,6 @@ apps/stereo-recorder/build/bin/
 ```bash
 apps/stereo-recorder/scripts/build.sh
 apps/stereo-recorder/scripts/record_session.sh 10
-```
-
-录制输出默认写入：
-
-```text
-artifacts/stereo-recorder/recordings/
 ```
 
 ## CI/CD 约定
