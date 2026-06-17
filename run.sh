@@ -38,6 +38,38 @@ esac
 REC="$BIN_DIR/stereo_record$EXEEXT"
 MUX="$BIN_DIR/hevc2mp4$EXEEXT"
 
+has_device_arg() {
+  for arg in "$@"; do
+    if [[ "$arg" == "--device" ]]; then
+      return 0
+    fi
+  done
+  return 1
+}
+
+detect_linux_v4l2_device() {
+  command -v v4l2-ctl >/dev/null 2>&1 || return 1
+
+  local dev fmt
+  while IFS= read -r dev; do
+    [[ -n "$dev" ]] || continue
+    fmt="$(v4l2-ctl -d "$dev" --list-formats-ext 2>/dev/null || true)"
+    if [[ "$fmt" == *"'MJPG'"* && "$fmt" == *"4000x1200"* && "$fmt" == *"60.000 fps"* ]]; then
+      printf '%s\n' "$dev"
+      return 0
+    fi
+  done < <(
+    v4l2-ctl --list-devices 2>/dev/null |
+      awk '
+        /DECXIN Camera/ { in_dev = 1; next }
+        /^[^[:space:]]/ { in_dev = 0 }
+        in_dev && /\/dev\/video[0-9]+/ { print $1 }
+      '
+  )
+
+  return 1
+}
+
 if [[ ! -x "$REC" || ! -x "$MUX" ]]; then
   echo "== Clean build recorder =="
   make -C "$APP_DIR" clean all
@@ -58,6 +90,17 @@ else
   echo "Duration: ${SECS}s"
 fi
 
+REC_ARGS=(--seconds "$SECS" --out "$DIR")
+if [[ -z "$EXEEXT" ]] && ! has_device_arg "$@"; then
+  if DEV="$(detect_linux_v4l2_device)"; then
+    echo "Device: $DEV (auto-detected DECXIN 4000x1200 MJPG@60)"
+    REC_ARGS+=(--device "$DEV")
+  else
+    echo "Device: recorder default (/dev/video0)"
+  fi
+fi
+REC_ARGS+=("$@")
+
 rec_pid=""
 interrupted=0
 on_int() {
@@ -70,7 +113,7 @@ on_int() {
 }
 
 trap on_int INT
-setsid "$REC" --seconds "$SECS" --out "$DIR" "$@" &
+setsid "$REC" "${REC_ARGS[@]}" &
 rec_pid=$!
 set +e
 while true; do

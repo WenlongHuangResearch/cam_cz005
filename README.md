@@ -15,7 +15,7 @@
 默认行为：
 
 - 自动编译 `apps/stereo-recorder/build/bin/stereo_record`
-- 使用 `/dev/video0` 打开相机
+- Linux 下自动查找 DECXIN Camera 中支持 `4000x1200 MJPEG@60fps` 的 `/dev/videoX`
 - 请求整幅 `4000x1200 MJPEG@60fps`
 - 左右两路分别用 H.265 编码
 - 一直录制，直到按 `Ctrl+C`
@@ -48,6 +48,8 @@
 ```
 
 其中 `seconds=0` 表示一直录到 `Ctrl+C`。如果想跳过 `output_root` 但继续传 recorder 参数，第二个参数传空字符串 `""`。
+
+Linux 下如果没有手动传 `--device`，`run.sh` 会用 `v4l2-ctl` 从 DECXIN Camera 的设备节点里自动选择支持 `4000x1200 MJPEG@60fps` 的节点。这样即使系统把相机枚举成 `/dev/video1` 或 `/dev/video2`，也不需要手动改脚本。手动传了 `--device` 时，以手动参数为准。
 
 ## 输出目录
 
@@ -115,7 +117,7 @@ input_format = mjpeg
 encoder      = hevc_mpp
 ```
 
-这不是简单地打开 `/dev/video0` 让系统自己选择默认模式。程序会在打开 V4L2 时显式传入 `video_size/framerate/input_format`，强制请求 `4000x1200 MJPEG@60fps`。
+`stereo_record` 自身的默认设备是 `/dev/video0`，但 `run.sh` 会在 Linux 下优先自动探测 DECXIN Camera 的实际 `/dev/videoX` 节点，并通过 `--device` 传给 recorder。这不是简单地打开某个设备让系统自己选择默认模式。程序会在打开 V4L2 时显式传入 `video_size/framerate/input_format`，强制请求 `4000x1200 MJPEG@60fps`。
 
 相关代码在：
 
